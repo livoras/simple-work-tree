@@ -24,8 +24,10 @@ COMMON_DIR="$(
   cd "$(git rev-parse --git-common-dir)"
   pwd
 )"
+MAIN_WORKTREE_ROOT="$(dirname "$COMMON_DIR")"
 REPO_NAME="$(basename "$(dirname "$COMMON_DIR")")"
 WORKTREE_ROOT="$SWT_HOME/$REPO_NAME/worktrees"
+PICKER_OUTPUT=""
 
 declare -a WORKTREE_PATHS=()
 declare -a WORKTREE_BRANCHES=()
@@ -39,6 +41,8 @@ Usage:
 Keys in picker:
   Enter         Switch to the selected worktree
   d             Remove the selected worktree
+                If the current linked worktree is selected, swt switches to the
+                main worktree first and then removes it
   j / k         Move selection
   Up / Down     Move selection
   q             Quit
@@ -279,9 +283,21 @@ remove_selected_worktree() {
   branch="${WORKTREE_BRANCHES[$idx]}"
 
   if [[ "$path" == "$CURRENT_ROOT" ]]; then
-    printf '\nCannot remove the current worktree. Press any key.\n' >&2
-    wait_for_key
-    return 1
+    if [[ "$CURRENT_ROOT" == "$MAIN_WORKTREE_ROOT" ]]; then
+      printf '\nCannot remove the main worktree. Press any key.\n' >&2
+      wait_for_key
+      return 1
+    fi
+
+    printf '\nRemove current worktree and switch to %s? [y/N] ' "$MAIN_WORKTREE_ROOT" >&2
+    IFS= read -r -s -n1 answer < /dev/tty || true
+    printf '\n' >&2
+    [[ "$answer" == [Yy] ]] || return 1
+
+    PICKER_OUTPUT="__SWT_SWITCH_REMOVE__
+$MAIN_WORKTREE_ROOT
+$CURRENT_ROOT"
+    return 2
   fi
 
   printf '\nRemove %s (%s)? [y/N] ' "$path" "$branch" >&2
@@ -337,6 +353,13 @@ pick_worktree() {
           if (( selected >= count )); then
             selected=$(( count - 1 ))
           fi
+        else
+          case $? in
+            2)
+              printf '%s\n' "$PICKER_OUTPUT"
+              return 0
+              ;;
+          esac
         fi
         ;;
       q)

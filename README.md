@@ -8,6 +8,7 @@ Minimal `git worktree` wrapper for people who want one command and no ceremony.
   Opens a tiny picker for the current repo's worktrees.
   `Enter` switches into the selected worktree.
   `d` removes the selected worktree.
+  If the selected row is the current linked worktree, `swt` switches back to the main worktree and then removes it.
 - `swt <name>`
   Switches to an existing worktree if it exists.
   Creates a new branch and worktree if it does not.
@@ -50,7 +51,7 @@ Each non-empty, non-comment line is treated as a glob relative to the repo root.
 
 ## Notes
 
-- The current worktree cannot be deleted from the picker.
+- The main worktree cannot be deleted from the picker.
 - `d` removes the worktree path. It does not delete the branch.
 - The base branch is chosen in this order:
   - `origin/HEAD`
