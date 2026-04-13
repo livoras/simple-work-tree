@@ -1,0 +1,391 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SWT_HOME="${SWT_HOME:-$HOME/.swt}"
+
+err() {
+  printf 'swt: %s\n' "$*" >&2
+}
+
+repo_root() {
+  git rev-parse --show-toplevel 2>/dev/null
+}
+
+current_repo_root() {
+  repo_root || {
+    err "not inside a git repository"
+    exit 1
+  }
+}
+
+CURRENT_ROOT="$(current_repo_root)"
+COMMON_DIR="$(
+  cd "$CURRENT_ROOT"
+  cd "$(git rev-parse --git-common-dir)"
+  pwd
+)"
+REPO_NAME="$(basename "$(dirname "$COMMON_DIR")")"
+WORKTREE_ROOT="$SWT_HOME/$REPO_NAME/worktrees"
+
+declare -a WORKTREE_PATHS=()
+declare -a WORKTREE_BRANCHES=()
+
+show_help() {
+  cat >&2 <<'EOF'
+Usage:
+  swt           Open the worktree picker
+  swt <name>    Switch to a worktree, or create it if missing
+
+Keys in picker:
+  Enter         Switch to the selected worktree
+  d             Remove the selected worktree
+  j / k         Move selection
+  Up / Down     Move selection
+  q             Quit
+EOF
+}
+
+load_worktrees() {
+  WORKTREE_PATHS=()
+  WORKTREE_BRANCHES=()
+
+  local line path="" branch=""
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ -z "$line" ]]; then
+      if [[ -n "$path" ]]; then
+        WORKTREE_PATHS+=("$path")
+        if [[ -n "$branch" ]]; then
+          WORKTREE_BRANCHES+=("${branch#refs/heads/}")
+        else
+          WORKTREE_BRANCHES+=("detached")
+        fi
+      fi
+      path=""
+      branch=""
+      continue
+    fi
+
+    case "$line" in
+      worktree\ *)
+        if [[ -n "$path" ]]; then
+          WORKTREE_PATHS+=("$path")
+          if [[ -n "$branch" ]]; then
+            WORKTREE_BRANCHES+=("${branch#refs/heads/}")
+          else
+            WORKTREE_BRANCHES+=("detached")
+          fi
+        fi
+        path="${line#worktree }"
+        branch=""
+        ;;
+      branch\ *)
+        branch="${line#branch }"
+        ;;
+    esac
+  done < <(git worktree list --porcelain)
+
+  if [[ -n "$path" ]]; then
+    WORKTREE_PATHS+=("$path")
+    if [[ -n "$branch" ]]; then
+      WORKTREE_BRANCHES+=("${branch#refs/heads/}")
+    else
+      WORKTREE_BRANCHES+=("detached")
+    fi
+  fi
+}
+
+find_worktree_path() {
+  local needle="$1"
+  local i path branch label
+
+  load_worktrees
+
+  for i in "${!WORKTREE_PATHS[@]}"; do
+    path="${WORKTREE_PATHS[$i]}"
+    branch="${WORKTREE_BRANCHES[$i]}"
+    if [[ "$branch" == "$needle" ]]; then
+      printf '%s\n' "$path"
+      return 0
+    fi
+  done
+
+  for i in "${!WORKTREE_PATHS[@]}"; do
+    path="${WORKTREE_PATHS[$i]}"
+    label="$(basename "$path")"
+    if [[ "$label" == "$needle" ]]; then
+      printf '%s\n' "$path"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+default_base_branch() {
+  local ref
+
+  if ref="$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null)"; then
+    printf '%s\n' "${ref#refs/remotes/origin/}"
+    return 0
+  fi
+
+  for ref in main master trunk develop; do
+    if git show-ref --verify --quiet "refs/heads/$ref"; then
+      printf '%s\n' "$ref"
+      return 0
+    fi
+  done
+
+  if ref="$(git symbolic-ref --quiet HEAD 2>/dev/null)"; then
+    printf '%s\n' "${ref#refs/heads/}"
+    return 0
+  fi
+
+  return 1
+}
+
+copy_config_path() {
+  local candidate
+  for candidate in "$CURRENT_ROOT/.copy" "$CURRENT_ROOT/.worktreeinclude"; do
+    if [[ -f "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+expand_copy_pattern() {
+  local root="$1"
+  local pattern="$2"
+
+  (
+    shopt -s dotglob globstar nullglob
+    cd "$root"
+    local matches=($pattern)
+    local match
+    for match in "${matches[@]}"; do
+      printf '%s\0' "$match"
+    done
+  )
+}
+
+apply_copy_rules() {
+  local src_root="$1"
+  local dest_root="$2"
+  local config pattern match src dest
+  local copied=0
+
+  config="$(copy_config_path || true)"
+  [[ -n "$config" ]] || return 0
+
+  while IFS= read -r pattern || [[ -n "$pattern" ]]; do
+    pattern="${pattern%$'\r'}"
+    [[ -z "$pattern" ]] && continue
+    [[ "${pattern:0:1}" == "#" ]] && continue
+
+    while IFS= read -r -d '' match; do
+      src="$src_root/$match"
+      dest="$dest_root/$match"
+
+      if [[ -d "$src" && ! -L "$src" ]]; then
+        mkdir -p "$dest"
+        rsync -a "$src/" "$dest/"
+      else
+        mkdir -p "$(dirname "$dest")"
+        rsync -a "$src" "$dest"
+      fi
+      copied=$((copied + 1))
+    done < <(expand_copy_pattern "$src_root" "$pattern")
+  done < "$config"
+
+  if (( copied > 0 )); then
+    printf 'swt: copied %d local path(s) from %s\n' "$copied" "$(basename "$config")" >&2
+  fi
+}
+
+ensure_worktree() {
+  local name="$1"
+  local path base parent_dir
+
+  path="$(find_worktree_path "$name" || true)"
+  if [[ -n "$path" ]]; then
+    printf '%s\n' "$path"
+    return 0
+  fi
+
+  path="$WORKTREE_ROOT/$name"
+  mkdir -p "$(dirname "$path")"
+  parent_dir="$(cd "$(dirname "$path")" && pwd -P)"
+  path="$parent_dir/$name"
+
+  if [[ -e "$path" ]]; then
+    err "target path already exists: $path"
+    return 1
+  fi
+
+  if git show-ref --verify --quiet "refs/heads/$name"; then
+    printf 'swt: reusing branch %s\n' "$name" >&2
+    git worktree add "$path" "$name" >&2
+  else
+    base="$(default_base_branch)" || {
+      err "could not determine a base branch"
+      return 1
+    }
+    printf 'swt: creating %s from %s\n' "$name" "$base" >&2
+    git worktree add -b "$name" "$path" "$base" >&2
+  fi
+
+  apply_copy_rules "$CURRENT_ROOT" "$path"
+  printf '%s\n' "$path"
+}
+
+render_picker() {
+  local selected="$1"
+  local i path label branch current
+
+  printf '\033[H\033[2J' >&2
+  printf 'swt  %s\n\n' "$REPO_NAME" >&2
+
+  for i in "${!WORKTREE_PATHS[@]}"; do
+    path="${WORKTREE_PATHS[$i]}"
+    label="$(basename "$path")"
+    branch="${WORKTREE_BRANCHES[$i]}"
+    current=""
+    if [[ "$path" == "$CURRENT_ROOT" ]]; then
+      current=" [current]"
+    fi
+
+    if (( i == selected )); then
+      printf '> %-20s %-28s %s%s\n' "$label" "$branch" "$path" "$current" >&2
+    else
+      printf '  %-20s %-28s %s%s\n' "$label" "$branch" "$path" "$current" >&2
+    fi
+  done
+
+  printf '\nEnter: open   d: delete   j/k or arrows: move   q: quit\n' >&2
+}
+
+wait_for_key() {
+  local _
+  IFS= read -r -s -n1 _ < /dev/tty || true
+}
+
+remove_selected_worktree() {
+  local idx="$1"
+  local answer path branch
+
+  path="${WORKTREE_PATHS[$idx]}"
+  branch="${WORKTREE_BRANCHES[$idx]}"
+
+  if [[ "$path" == "$CURRENT_ROOT" ]]; then
+    printf '\nCannot remove the current worktree. Press any key.\n' >&2
+    wait_for_key
+    return 1
+  fi
+
+  printf '\nRemove %s (%s)? [y/N] ' "$path" "$branch" >&2
+  IFS= read -r -s -n1 answer < /dev/tty || true
+  printf '\n' >&2
+  [[ "$answer" == [Yy] ]] || return 1
+
+  if ! git worktree remove "$path" >&2; then
+    printf 'Press any key to continue.\n' >&2
+    wait_for_key
+    return 1
+  fi
+
+  return 0
+}
+
+pick_worktree() {
+  local selected=0
+  local key rest count
+
+  [[ -r /dev/tty ]] || {
+    err "interactive mode needs a tty"
+    return 1
+  }
+
+  load_worktrees
+  count="${#WORKTREE_PATHS[@]}"
+  (( count > 0 )) || {
+    err "no worktrees in this repo"
+    return 1
+  }
+
+  while true; do
+    render_picker "$selected"
+    IFS= read -r -s -n1 key < /dev/tty || return 1
+
+    case "$key" in
+      "")
+        printf '%s\n' "${WORKTREE_PATHS[$selected]}"
+        return 0
+        ;;
+      j)
+        selected=$(( (selected + 1) % count ))
+        ;;
+      k)
+        selected=$(( (selected - 1 + count) % count ))
+        ;;
+      d)
+        if remove_selected_worktree "$selected"; then
+          load_worktrees
+          count="${#WORKTREE_PATHS[@]}"
+          (( count > 0 )) || return 1
+          if (( selected >= count )); then
+            selected=$(( count - 1 ))
+          fi
+        fi
+        ;;
+      q)
+        return 1
+        ;;
+      $'\x03')
+        return 130
+        ;;
+      $'\x1b')
+        IFS= read -r -s -n2 -t 0.05 rest < /dev/tty || rest=""
+        case "$rest" in
+          "[A")
+            selected=$(( (selected - 1 + count) % count ))
+            ;;
+          "[B")
+            selected=$(( (selected + 1) % count ))
+            ;;
+          "")
+            return 1
+            ;;
+        esac
+        ;;
+    esac
+  done
+}
+
+main() {
+  if (( $# == 0 )); then
+    pick_worktree
+    return
+  fi
+
+  if (( $# > 1 )); then
+    err "expected zero or one argument"
+    exit 1
+  fi
+
+  case "$1" in
+    -h|--help)
+      show_help
+      ;;
+    -*)
+      err "unknown option: $1"
+      exit 1
+      ;;
+    *)
+      ensure_worktree "$1"
+      ;;
+  esac
+}
+
+main "$@"
